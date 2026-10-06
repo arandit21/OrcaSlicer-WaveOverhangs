@@ -43,6 +43,11 @@ private:
     std::string make_url(const std::string& path) const;
     void start_print(const std::string& path) const;
     std::string safe_filename(const std::string& filename) const;
+
+    // Sonic Pad compatibility path. Standard Creality Print remains the primary path.
+    bool test_moonraker(wxString& msg) const;
+    bool upload_moonraker(PrintHostUpload upload_data, ProgressFn progress_fn, ErrorFn error_fn, InfoFn info_fn) const;
+    bool start_print_moonraker(const std::string& remote_filename, ErrorFn error_fn) const;
 };
 } // namespace Slic3r
 
