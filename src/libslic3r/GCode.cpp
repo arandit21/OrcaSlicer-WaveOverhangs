@@ -31,6 +31,7 @@
 #include <string>
 #include <utility>
 #include <string_view>
+#include <sstream>
 
 #include <regex>
 #include <boost/algorithm/string.hpp>
@@ -6076,6 +6077,122 @@ std::string GCode::extrude_path(ExtrusionPath path, std::string description, dou
     return gcode;
 }
 
+// Diagnostic-only Wave Overhang physical-order trace. It only observes
+// entities; it never mutates geometry, roles or print order.
+static const char *wave_phys_order_entity_type(const ExtrusionEntity &entity)
+{
+    if (dynamic_cast<const ExtrusionPath*>(&entity) != nullptr)
+        return "ExtrusionPath";
+    if (dynamic_cast<const ExtrusionLoop*>(&entity) != nullptr)
+        return "ExtrusionLoop";
+    if (dynamic_cast<const ExtrusionMultiPath*>(&entity) != nullptr)
+        return "ExtrusionMultiPath";
+    if (dynamic_cast<const ExtrusionEntityCollection*>(&entity) != nullptr)
+        return "ExtrusionEntityCollection";
+    return "ExtrusionEntity";
+}
+
+static bool wave_phys_order_entity_empty(const ExtrusionEntity &entity)
+{
+    if (const auto *path = dynamic_cast<const ExtrusionPath*>(&entity))
+        return path->empty();
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity))
+        return loop->paths.empty();
+    if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(&entity))
+        return multi->paths.empty();
+    if (const auto *coll = dynamic_cast<const ExtrusionEntityCollection*>(&entity))
+        return coll->empty();
+    return false;
+}
+
+static bool wave_phys_order_has_wave_path(const ExtrusionEntity &entity)
+{
+    if (const auto *path = dynamic_cast<const ExtrusionPath*>(&entity))
+        return path->wave_overhang;
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity))
+        return std::any_of(loop->paths.begin(), loop->paths.end(),
+                           [](const ExtrusionPath &path) { return path.wave_overhang; });
+    if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(&entity))
+        return std::any_of(multi->paths.begin(), multi->paths.end(),
+                           [](const ExtrusionPath &path) { return path.wave_overhang; });
+    if (const auto *coll = dynamic_cast<const ExtrusionEntityCollection*>(&entity))
+        return std::any_of(coll->entities.begin(), coll->entities.end(),
+                           [](const ExtrusionEntity *child) {
+                               return child != nullptr && wave_phys_order_has_wave_path(*child);
+                           });
+    return false;
+}
+
+static double wave_phys_order_length_mm(const ExtrusionEntity &entity)
+{
+    if (const auto *coll = dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
+        double total = 0.;
+        for (const ExtrusionEntity *child : coll->entities)
+            if (child != nullptr)
+                total += wave_phys_order_length_mm(*child);
+        return total;
+    }
+    return unscale<double>(entity.length());
+}
+
+static std::string wave_phys_order_entity_summary(char boundary, size_t ordinal,
+                                                  const ExtrusionEntity &entity,
+                                                  int parent = -1, int child = -1)
+{
+    const bool empty  = wave_phys_order_entity_empty(entity);
+    const bool closed = !empty && entity.first_point() == entity.last_point();
+    const Point first = empty ? Point::Zero() : entity.first_point();
+    const Point last  = empty ? Point::Zero() : entity.last_point();
+
+    std::ostringstream out;
+    out << "WAVE_PHYS_ORDER " << boundary
+        << " id=" << boundary << ordinal
+        << " ordinal=" << ordinal
+        << " parent=" << parent
+        << " child=" << child
+        << " type=" << wave_phys_order_entity_type(entity)
+        << " role=" << int(entity.role())
+        << " inset=" << entity.inset_idx
+        << " wave=" << (wave_phys_order_has_wave_path(entity) ? 1 : 0)
+        << " closed=" << (closed ? 1 : 0)
+        << " x0=" << unscale<double>(first.x())
+        << " y0=" << unscale<double>(first.y())
+        << " x1=" << unscale<double>(last.x())
+        << " y1=" << unscale<double>(last.y())
+        << " length_mm=" << (empty ? 0. : wave_phys_order_length_mm(entity));
+    return out.str();
+}
+
+static void wave_phys_order_log_entity(char boundary, size_t ordinal, const ExtrusionEntity &entity)
+{
+    BOOST_LOG_TRIVIAL(info) << wave_phys_order_entity_summary(boundary, ordinal, entity);
+
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity)) {
+        for (size_t i = 0; i < loop->paths.size(); ++i)
+            BOOST_LOG_TRIVIAL(info)
+                << wave_phys_order_entity_summary(boundary, ordinal, loop->paths[i], int(ordinal), int(i));
+    } else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(&entity)) {
+        for (size_t i = 0; i < multi->paths.size(); ++i)
+            BOOST_LOG_TRIVIAL(info)
+                << wave_phys_order_entity_summary(boundary, ordinal, multi->paths[i], int(ordinal), int(i));
+    }
+}
+
+static std::string wave_phys_order_gcode_comments(char boundary, size_t ordinal, const ExtrusionEntity &entity)
+{
+    std::string out = "; " + wave_phys_order_entity_summary(boundary, ordinal, entity) + "\n";
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity)) {
+        for (size_t i = 0; i < loop->paths.size(); ++i)
+            out += "; " + wave_phys_order_entity_summary(boundary, ordinal, loop->paths[i], int(ordinal), int(i)) + "\n";
+    } else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(&entity)) {
+        for (size_t i = 0; i < multi->paths.size(); ++i)
+            out += "; " + wave_phys_order_entity_summary(boundary, ordinal, multi->paths[i], int(ordinal), int(i)) + "\n";
+    }
+    return out;
+}
+
+static size_t wave_phys_order_d_ordinal = 0;
+
 // Extrude perimeters: Decide where to put seams (hide or align seams).
 std::string GCode::extrude_perimeters(const Print &print, const std::vector<ObjectByExtruder::Island::Region> &by_region, bool is_first_layer, bool is_infill_first)
 {
@@ -6089,8 +6206,16 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
                 : (m_config.is_infill_first == is_infill_first);
             if (!should_print) continue;
 
-            for (const ExtrusionEntity* ee : region.perimeters)
+            const bool trace_wave_order = m_config.wave_overhangs.value &&
+                                          m_config.wave_overhang_debug_gcode.value;
+            for (const ExtrusionEntity* ee : region.perimeters) {
+                if (trace_wave_order && ee != nullptr) {
+                    const size_t ordinal = wave_phys_order_d_ordinal++;
+                    wave_phys_order_log_entity('D', ordinal, *ee);
+                    gcode += wave_phys_order_gcode_comments('D', ordinal, *ee);
+                }
                 gcode += this->extrude_entity(*ee, "perimeter", -1., region.perimeters);
+            }
         }
     return gcode;
 }
@@ -8211,12 +8336,21 @@ void GCode::ObjectByExtruder::Island::Region::append(const Type type, const Extr
     // First we append the entities, there are eec->entities.size() of them:
     size_t old_size = perimeters_or_infills->size();
     size_t new_size = old_size + (eec->can_sort() ? eec->entities.size() : 1);
+    const bool trace_wave_order = type == PERIMETERS && wave_phys_order_has_wave_path(*eec);
     perimeters_or_infills->reserve(new_size);
     if (eec->can_sort()) {
         for (auto* ee : eec->entities)
             perimeters_or_infills->emplace_back(ee);
     } else
         perimeters_or_infills->emplace_back(const_cast<ExtrusionEntityCollection*>(eec));
+
+    if (trace_wave_order) {
+        for (size_t ordinal = old_size; ordinal < perimeters_or_infills->size(); ++ordinal) {
+            const ExtrusionEntity *entity = (*perimeters_or_infills)[ordinal];
+            if (entity != nullptr)
+                wave_phys_order_log_entity('C', ordinal, *entity);
+        }
+    }
 
     if (copies_extruder != nullptr) {
         // Don't reallocate overrides if not needed.
