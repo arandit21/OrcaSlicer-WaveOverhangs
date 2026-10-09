@@ -32,6 +32,10 @@
 #include <utility>
 #include <string_view>
 #include <sstream>
+#include <fstream>
+#include <mutex>
+#include <atomic>
+#include <cstdint>
 
 #include <regex>
 #include <boost/algorithm/string.hpp>
@@ -88,6 +92,118 @@ namespace Slic3r {
 #define _(s) Slic3r::I18N::translate(s)
 
 static const float g_min_purge_volume = 100.f;
+
+namespace {
+struct WavePhysicalOrderTraceState {
+    std::mutex      mutex;
+    std::ofstream   file;
+    std::string     path;
+    std::string     error;
+    bool            initialized{false};
+    bool            open_failed{false};
+    bool            write_failed{false};
+};
+
+static WavePhysicalOrderTraceState& wave_phys_order_trace_state()
+{
+    static WavePhysicalOrderTraceState state;
+    return state;
+}
+
+static std::atomic<bool> g_wave_phys_order_trace_enabled{false};
+
+static void wave_phys_order_trace_report_error(const std::string &message)
+{
+    BOOST_LOG_TRIVIAL(error) << "WAVE_PHYS_TRACE_ERROR " << message;
+    std::cerr << "WAVE_PHYS_TRACE_ERROR " << message << std::endl;
+}
+
+static void wave_phys_order_trace_initialize_locked(WavePhysicalOrderTraceState &state)
+{
+    if (state.initialized)
+        return;
+    state.initialized = true;
+
+    try {
+        const boost::filesystem::path trace_dir = boost::filesystem::path(data_dir()) / "log";
+        state.path = (trace_dir / "wave_physical_order_trace.log").make_preferred().string();
+        boost::filesystem::create_directories(trace_dir);
+        state.file.open(state.path, std::ios::out | std::ios::trunc);
+        if (!state.file.is_open()) {
+            state.open_failed = true;
+            state.error = "open_failed path=" + state.path;
+            wave_phys_order_trace_report_error(state.error);
+            return;
+        }
+
+        const auto session_id = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        state.file << "WAVE_PHYS_TRACE SESSION id=" << session_id
+                   << " path=" << state.path << "\n";
+        state.file.flush();
+        if (!state.file.good()) {
+            state.write_failed = true;
+            state.error = "initial_write_failed path=" + state.path;
+            wave_phys_order_trace_report_error(state.error);
+        }
+    } catch (const std::exception &e) {
+        state.open_failed = true;
+        state.error = std::string("exception=") + e.what() + " path=" + state.path;
+        wave_phys_order_trace_report_error(state.error);
+    }
+}
+} // namespace
+
+void wave_phys_order_trace_enable()
+{
+    g_wave_phys_order_trace_enabled.store(true, std::memory_order_release);
+    WavePhysicalOrderTraceState &state = wave_phys_order_trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    wave_phys_order_trace_initialize_locked(state);
+}
+
+bool wave_phys_order_trace_is_enabled()
+{
+    return g_wave_phys_order_trace_enabled.load(std::memory_order_acquire);
+}
+
+bool wave_phys_order_trace_write(const std::string &line)
+{
+    if (!wave_phys_order_trace_is_enabled())
+        return false;
+
+    WavePhysicalOrderTraceState &state = wave_phys_order_trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    wave_phys_order_trace_initialize_locked(state);
+    if (state.open_failed || !state.file.is_open())
+        return false;
+
+    state.file << line << '\n';
+    state.file.flush();
+    if (!state.file.good()) {
+        if (!state.write_failed) {
+            state.write_failed = true;
+            state.error = "write_failed path=" + state.path;
+            wave_phys_order_trace_report_error(state.error);
+        }
+        return false;
+    }
+    return true;
+}
+
+std::string wave_phys_order_trace_status()
+{
+    WavePhysicalOrderTraceState &state = wave_phys_order_trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.initialized)
+        return "status=NOT_INITIALIZED path=" +
+               (boost::filesystem::path(data_dir()) / "log" / "wave_physical_order_trace.log").make_preferred().string();
+    if (state.open_failed)
+        return "status=OPEN_FAILED path=" + state.path + " error=" + state.error;
+    if (state.write_failed)
+        return "status=WRITE_FAILED path=" + state.path + " error=" + state.error;
+    return "status=OK path=" + state.path;
+}
 static const float g_purge_volume_one_time = 135.f;
 static const int g_max_flush_count = 4;
 static const size_t g_max_label_object = 64;
@@ -6163,21 +6279,44 @@ static std::string wave_phys_order_entity_summary(char boundary, size_t ordinal,
     return out.str();
 }
 
-static void wave_phys_order_log_entity(char boundary, size_t ordinal, const ExtrusionEntity &entity)
+std::string wave_phys_order_collection_signature(const ExtrusionEntityCollection &collection)
 {
-    BOOST_LOG_TRIVIAL(info) << wave_phys_order_entity_summary(boundary, ordinal, entity);
-
-    if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity)) {
-        for (size_t i = 0; i < loop->paths.size(); ++i)
-            BOOST_LOG_TRIVIAL(info)
-                << wave_phys_order_entity_summary(boundary, ordinal, loop->paths[i], int(ordinal), int(i));
-    } else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(&entity)) {
-        for (size_t i = 0; i < multi->paths.size(); ++i)
-            BOOST_LOG_TRIVIAL(info)
-                << wave_phys_order_entity_summary(boundary, ordinal, multi->paths[i], int(ordinal), int(i));
+    uint64_t hash = 1469598103934665603ULL;
+    size_t ordinal = 0;
+    for (const ExtrusionEntity *entity : collection.entities) {
+        if (entity == nullptr)
+            continue;
+        const std::string token = wave_phys_order_entity_summary('S', ordinal++, *entity);
+        for (const unsigned char ch : token) {
+            hash ^= uint64_t(ch);
+            hash *= 1099511628211ULL;
+        }
     }
+    std::ostringstream out;
+    out << std::hex << hash;
+    return out.str();
 }
 
+static void wave_phys_order_log_entity(char boundary, size_t ordinal, const ExtrusionEntity &entity,
+                                       const std::string &context = {})
+{
+    auto emit = [&](size_t item_ordinal, const ExtrusionEntity &item, int parent, int child) {
+        std::string line = wave_phys_order_entity_summary(boundary, item_ordinal, item, parent, child);
+        if (!context.empty())
+            line += " " + context;
+        BOOST_LOG_TRIVIAL(info) << line;
+        wave_phys_order_trace_write(line);
+    };
+
+    emit(ordinal, entity, -1, -1);
+    if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity)) {
+        for (size_t i = 0; i < loop->paths.size(); ++i)
+            emit(ordinal, loop->paths[i], int(ordinal), int(i));
+    } else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(&entity)) {
+        for (size_t i = 0; i < multi->paths.size(); ++i)
+            emit(ordinal, multi->paths[i], int(ordinal), int(i));
+    }
+}
 static std::string wave_phys_order_gcode_comments(char boundary, size_t ordinal, const ExtrusionEntity &entity)
 {
     std::string out = "; " + wave_phys_order_entity_summary(boundary, ordinal, entity) + "\n";
@@ -6197,6 +6336,7 @@ static size_t wave_phys_order_d_ordinal = 0;
 std::string GCode::extrude_perimeters(const Print &print, const std::vector<ObjectByExtruder::Island::Region> &by_region, bool is_first_layer, bool is_infill_first)
 {
     std::string gcode;
+    bool trace_status_emitted = false;
     for (const ObjectByExtruder::Island::Region &region : by_region)
         if (! region.perimeters.empty()) {
             m_config.apply(print.get_print_region(&region - &by_region.front()).config());
@@ -6208,6 +6348,11 @@ std::string GCode::extrude_perimeters(const Print &print, const std::vector<Obje
 
             const bool trace_wave_order = m_config.wave_overhangs.value &&
                                           m_config.wave_overhang_debug_gcode.value;
+            if (trace_wave_order && !trace_status_emitted) {
+                wave_phys_order_trace_enable();
+                gcode += "; WAVE_PHYS_TRACE_FILE " + wave_phys_order_trace_status() + "\n";
+                trace_status_emitted = true;
+            }
             for (const ExtrusionEntity* ee : region.perimeters) {
                 if (trace_wave_order && ee != nullptr) {
                     const size_t ordinal = wave_phys_order_d_ordinal++;
@@ -8336,7 +8481,36 @@ void GCode::ObjectByExtruder::Island::Region::append(const Type type, const Extr
     // First we append the entities, there are eec->entities.size() of them:
     size_t old_size = perimeters_or_infills->size();
     size_t new_size = old_size + (eec->can_sort() ? eec->entities.size() : 1);
-    const bool trace_wave_order = type == PERIMETERS && wave_phys_order_has_wave_path(*eec);
+    const bool trace_wave_order = type == PERIMETERS && wave_phys_order_trace_is_enabled();
+
+    std::string trace_signature;
+    if (trace_wave_order) {
+        trace_signature = wave_phys_order_collection_signature(*eec);
+        size_t source_wave_entities = 0;
+        for (const ExtrusionEntity *entity : eec->entities)
+            if (entity != nullptr && wave_phys_order_has_wave_path(*entity))
+                ++source_wave_entities;
+
+        std::ostringstream entry;
+        entry << "WAVE_PHYS_ORDER C_ENTRY"
+              << " eec_ptr=" << static_cast<const void*>(eec)
+              << " signature=" << trace_signature
+              << " can_sort=" << (eec->can_sort() ? 1 : 0)
+              << " no_sort=" << (eec->no_sort ? 1 : 0)
+              << " source_count=" << eec->entities.size()
+              << " source_wave_entities=" << source_wave_entities
+              << " old_size=" << old_size
+              << " expected_new_size=" << new_size;
+        wave_phys_order_trace_write(entry.str());
+
+        for (size_t source_ordinal = 0; source_ordinal < eec->entities.size(); ++source_ordinal) {
+            const ExtrusionEntity *entity = eec->entities[source_ordinal];
+            if (entity != nullptr)
+                wave_phys_order_log_entity('C', source_ordinal, *entity,
+                    "phase=source signature=" + trace_signature);
+        }
+    }
+
     perimeters_or_infills->reserve(new_size);
     if (eec->can_sort()) {
         for (auto* ee : eec->entities)
@@ -8345,10 +8519,18 @@ void GCode::ObjectByExtruder::Island::Region::append(const Type type, const Extr
         perimeters_or_infills->emplace_back(const_cast<ExtrusionEntityCollection*>(eec));
 
     if (trace_wave_order) {
+        std::ostringstream result;
+        result << "WAVE_PHYS_ORDER C_RESULT"
+               << " signature=" << trace_signature
+               << " inserted_count=" << (perimeters_or_infills->size() - old_size)
+               << " actual_new_size=" << perimeters_or_infills->size();
+        wave_phys_order_trace_write(result.str());
+
         for (size_t ordinal = old_size; ordinal < perimeters_or_infills->size(); ++ordinal) {
             const ExtrusionEntity *entity = (*perimeters_or_infills)[ordinal];
             if (entity != nullptr)
-                wave_phys_order_log_entity('C', ordinal, *entity);
+                wave_phys_order_log_entity('C', ordinal, *entity,
+                    "phase=inserted signature=" + trace_signature);
         }
     }
 

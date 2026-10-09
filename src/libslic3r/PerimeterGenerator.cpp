@@ -19,6 +19,7 @@
 #include <cassert>
 #include <unordered_set>
 #include <thread>
+#include <sstream>
 #include <boost/log/trivial.hpp>
 #include "libslic3r/AABBTreeLines.hpp"
 #include "Print.hpp"
@@ -32,6 +33,12 @@ static constexpr double SMALLER_EXT_INSET_OVERLAP_TOLERANCE = 0.22;
 namespace Slic3r {
     
 using namespace Slic3r::Feature::FuzzySkin;
+
+// Reliable trace sink is implemented once in GCode.cpp so A/B/C share one
+// mutex, one file and one failure state across translation units.
+void wave_phys_order_trace_enable();
+bool wave_phys_order_trace_write(const std::string &line);
+std::string wave_phys_order_collection_signature(const ExtrusionEntityCollection &collection);
 
 // Diagnostic-only helpers for tracing the physical Wave Overhang extrusion
 // order. These helpers intentionally do not mutate geometry, roles or order.
@@ -92,15 +99,16 @@ static double wave_phys_order_length_mm(const ExtrusionEntity &entity)
 }
 
 static void wave_phys_order_log_path(char boundary, size_t ordinal, const ExtrusionPath &path,
-                                     int region_idx = -1, int parent_ordinal = -1, int child_ordinal = -1)
+                                     int region_idx = -1, int parent_ordinal = -1, int child_ordinal = -1,
+                                     const std::string &context = {})
 {
     const bool empty  = path.empty();
     const bool closed = !empty && path.first_point() == path.last_point();
     const Point first = empty ? Point::Zero() : path.first_point();
     const Point last  = empty ? Point::Zero() : path.last_point();
 
-    BOOST_LOG_TRIVIAL(info)
-        << "WAVE_PHYS_ORDER " << boundary
+    std::ostringstream out;
+    out << "WAVE_PHYS_ORDER " << boundary
         << " id=" << boundary << ordinal
         << " ordinal=" << ordinal
         << " region=" << region_idx
@@ -116,17 +124,23 @@ static void wave_phys_order_log_path(char boundary, size_t ordinal, const Extrus
         << " x1=" << unscale<double>(last.x())
         << " y1=" << unscale<double>(last.y())
         << " length_mm=" << (empty ? 0. : unscale<double>(path.length()));
-}
+    if (!context.empty())
+        out << " " << context;
 
-static void wave_phys_order_log_entity(char boundary, size_t ordinal, const ExtrusionEntity &entity)
+    const std::string line = out.str();
+    BOOST_LOG_TRIVIAL(info) << line;
+    wave_phys_order_trace_write(line);
+}
+static void wave_phys_order_log_entity(char boundary, size_t ordinal, const ExtrusionEntity &entity,
+                                       const std::string &context = {})
 {
     const bool empty  = wave_phys_order_entity_empty(entity);
     const bool closed = !empty && entity.first_point() == entity.last_point();
     const Point first = empty ? Point::Zero() : entity.first_point();
     const Point last  = empty ? Point::Zero() : entity.last_point();
 
-    BOOST_LOG_TRIVIAL(info)
-        << "WAVE_PHYS_ORDER " << boundary
+    std::ostringstream out;
+    out << "WAVE_PHYS_ORDER " << boundary
         << " id=" << boundary << ordinal
         << " ordinal=" << ordinal
         << " type=" << wave_phys_order_entity_type(entity)
@@ -139,21 +153,26 @@ static void wave_phys_order_log_entity(char boundary, size_t ordinal, const Extr
         << " x1=" << unscale<double>(last.x())
         << " y1=" << unscale<double>(last.y())
         << " length_mm=" << (empty ? 0. : wave_phys_order_length_mm(entity));
+    if (!context.empty())
+        out << " " << context;
+
+    const std::string line = out.str();
+    BOOST_LOG_TRIVIAL(info) << line;
+    wave_phys_order_trace_write(line);
 
     if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity)) {
         for (size_t i = 0; i < loop->paths.size(); ++i)
-            wave_phys_order_log_path(boundary, ordinal, loop->paths[i], -1, int(ordinal), int(i));
+            wave_phys_order_log_path(boundary, ordinal, loop->paths[i], -1, int(ordinal), int(i), context);
     } else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(&entity)) {
         for (size_t i = 0; i < multi->paths.size(); ++i)
-            wave_phys_order_log_path(boundary, ordinal, multi->paths[i], -1, int(ordinal), int(i));
+            wave_phys_order_log_path(boundary, ordinal, multi->paths[i], -1, int(ordinal), int(i), context);
     } else if (const auto *coll = dynamic_cast<const ExtrusionEntityCollection*>(&entity)) {
         size_t child = 0;
         for (const ExtrusionEntity *nested : coll->entities)
             if (nested != nullptr)
-                wave_phys_order_log_entity(boundary, ordinal * 1000 + child++, *nested);
+                wave_phys_order_log_entity(boundary, ordinal * 1000 + child++, *nested, context);
     }
 }
-
 // Hierarchy of perimeters.
 class PerimeterGeneratorLoop {
 public:
@@ -1217,7 +1236,8 @@ static std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_wave_overhang_
     int                      additional_shell_count_override,
     const PrintRegionConfig &region_config,
     const Flow              &overhang_flow,
-    double                   scaled_resolution)
+    double                   scaled_resolution,
+    const std::string       &trace_context)
 {
     WaveOverhangs::CommonParams params;
     params.perimeter_count        = perimeter_count;
@@ -1258,14 +1278,43 @@ static std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_wave_overhang_
     if (infill_area.empty())
         return { {}, {} };
 
+    const bool trace_wave_order = region_config.wave_overhang_debug_gcode.value;
+    if (trace_wave_order) {
+        std::ostringstream call;
+        call << "WAVE_PHYS_ORDER GENERATOR_CALL " << trace_context
+             << " infill_regions=" << infill_area.size()
+             << " lower_polygons=" << lower_slices_polygons.size()
+             << " perimeter_count=" << perimeter_count
+             << " additional_shell_count=" << std::max(0, additional_shell_count_override);
+        wave_phys_order_trace_write(call.str());
+    }
+
     WaveOverhangs::AndersonsGenerator gen;
     WaveOverhangs::GenerateResult res = gen.generate(infill_area, lower_slices_polygons, params);
 
-    if (region_config.wave_overhangs.value && region_config.wave_overhang_debug_gcode.value) {
+    if (trace_wave_order) {
+        size_t total_paths = 0;
+        size_t wave_paths = 0;
+        for (const ExtrusionPaths &region : res.paths) {
+            total_paths += region.size();
+            for (const ExtrusionPath &path : region)
+                if (path.wave_overhang)
+                    ++wave_paths;
+        }
+
+        std::ostringstream result;
+        result << "WAVE_PHYS_ORDER A_RESULT " << trace_context
+               << " regions=" << res.paths.size()
+               << " total_paths=" << total_paths
+               << " wave_paths=" << wave_paths
+               << " residual_polygons=" << res.residual.size()
+               << " status=" << (total_paths == 0 ? "RETURNED_ZERO" : "RETURNED_PATHS");
+        wave_phys_order_trace_write(result.str());
+
         size_t ordinal = 0;
         for (size_t region_idx = 0; region_idx < res.paths.size(); ++region_idx)
             for (const ExtrusionPath &path : res.paths[region_idx])
-                wave_phys_order_log_path('A', ordinal++, path, int(region_idx));
+                wave_phys_order_log_path('A', ordinal++, path, int(region_idx), -1, -1, trace_context);
     }
 
     return { std::move(res.paths), std::move(res.residual) };
@@ -1394,6 +1443,65 @@ void PerimeterGenerator::apply_extra_perimeters(ExPolygons &infill_area, const E
 {
     const bool use_wave_overhangs = this->config->wave_overhangs;
     const bool gate_extra_perims  = this->config->extra_perimeters_on_overhangs || use_wave_overhangs;
+    const bool trace_wave_order   = this->config->wave_overhang_debug_gcode.value;
+
+    std::string trace_context;
+    if (trace_wave_order) {
+        wave_phys_order_trace_enable();
+
+        const BoundingBox island_bbox = get_extents(ExPolygons{island_region});
+        std::ostringstream context;
+        context << "layer=" << this->layer_id
+                << " z=" << this->slice_z
+                << " island_bbox="
+                << unscale<double>(island_bbox.min.x()) << ","
+                << unscale<double>(island_bbox.min.y()) << ","
+                << unscale<double>(island_bbox.max.x()) << ","
+                << unscale<double>(island_bbox.max.y());
+        trace_context = context.str();
+
+        const bool base_gate =
+            !m_spiral_vase &&
+            this->lower_slices != nullptr &&
+            this->config->detect_overhang_wall.value &&
+            gate_extra_perims &&
+            this->config->wall_loops.value > 0 &&
+            this->layer_id > this->object_config->raft_layers.value;
+
+        std::ostringstream entry;
+        entry << "WAVE_PHYS_ORDER ENTRY " << trace_context
+              << " wave_enabled=" << (use_wave_overhangs ? 1 : 0)
+              << " spiral_vase=" << (m_spiral_vase ? 1 : 0)
+              << " lower_slices_present=" << (this->lower_slices != nullptr ? 1 : 0)
+              << " detect_overhang_wall=" << (this->config->detect_overhang_wall.value ? 1 : 0)
+              << " extra_perimeters_on_overhangs=" << (this->config->extra_perimeters_on_overhangs.value ? 1 : 0)
+              << " gate_extra_perims=" << (gate_extra_perims ? 1 : 0)
+              << " wall_loops=" << this->config->wall_loops.value
+              << " raft_layers=" << this->object_config->raft_layers.value
+              << " base_gate=" << (base_gate ? 1 : 0);
+        wave_phys_order_trace_write(entry.str());
+
+        if (!use_wave_overhangs || !base_gate) {
+            std::ostringstream skipped;
+            skipped << "WAVE_PHYS_ORDER GENERATOR_NOT_CALLED " << trace_context << " reasons=";
+            bool first_reason = true;
+            auto add_reason = [&](const char *reason) {
+                if (!first_reason) skipped << ",";
+                skipped << reason;
+                first_reason = false;
+            };
+            if (!use_wave_overhangs) add_reason("wave_disabled");
+            if (m_spiral_vase) add_reason("spiral_vase");
+            if (this->lower_slices == nullptr) add_reason("lower_slices_null");
+            if (!this->config->detect_overhang_wall.value) add_reason("detect_overhang_wall_off");
+            if (!gate_extra_perims) add_reason("extra_perimeter_gate_off");
+            if (this->config->wall_loops.value <= 0) add_reason("wall_loops_zero");
+            if (this->layer_id <= this->object_config->raft_layers.value) add_reason("raft_or_first_layer_gate");
+            if (first_reason) add_reason("unknown");
+            wave_phys_order_trace_write(skipped.str());
+        }
+    }
+
     if (!m_spiral_vase && this->lower_slices != nullptr && this->config->detect_overhang_wall && gate_extra_perims &&
         this->config->wall_loops > 0 && this->layer_id > this->object_config->raft_layers) {
         // Semantic: wave_overhang_outer_perimeters = N means "keep N outermost normal
@@ -1444,10 +1552,16 @@ void PerimeterGenerator::apply_extra_perimeters(ExPolygons &infill_area, const E
             ? generate_wave_overhang_paths(wave_infill, this->lower_slices_polygons(),
                                            this->config->wall_loops, /*additional_shell_count=*/0,
                                            *this->config,
-                                           this->overhang_flow, this->m_scaled_resolution)
+                                           this->overhang_flow, this->m_scaled_resolution,
+                                           trace_context)
             : generate_extra_perimeters_over_overhangs(infill_area, this->lower_slices_polygons(),
                                                         this->config->wall_loops, this->overhang_flow,
                                                         this->m_scaled_resolution, *this->object_config, *this->print_config);
+
+        if (trace_wave_order && use_wave_overhangs && extra_perimeters.empty()) {
+            wave_phys_order_trace_write("WAVE_PHYS_ORDER B_NOT_REACHED " + trace_context +
+                                        " reason=generator_returned_no_paths");
+        }
 
         if (use_wave_overhangs) {
             // Wave-overhang lines hang in air, not squished against a layer
@@ -1505,11 +1619,30 @@ void PerimeterGenerator::apply_extra_perimeters(ExPolygons &infill_area, const E
             }
             this_islands_perimeters->swap(new_perimeters);
 
-            if (use_wave_overhangs && this->config->wave_overhang_debug_gcode.value) {
+            if (use_wave_overhangs && trace_wave_order) {
+                size_t wave_entities = 0;
+                for (const ExtrusionEntity *entity : this_islands_perimeters->entities)
+                    if (entity != nullptr && wave_phys_order_has_wave_path(*entity))
+                        ++wave_entities;
+
+                const std::string signature =
+                    wave_phys_order_collection_signature(*this_islands_perimeters);
+                std::ostringstream collection;
+                collection << "WAVE_PHYS_ORDER B_COLLECTION " << trace_context
+                           << " collection_ptr=" << static_cast<const void*>(this_islands_perimeters)
+                           << " signature=" << signature
+                           << " entities=" << this_islands_perimeters->entities.size()
+                           << " wave_entities=" << wave_entities
+                           << " can_sort=" << (this_islands_perimeters->can_sort() ? 1 : 0)
+                           << " no_sort=" << (this_islands_perimeters->no_sort ? 1 : 0);
+                wave_phys_order_trace_write(collection.str());
+
                 size_t ordinal = 0;
+                const std::string b_context =
+                    trace_context + " signature=" + signature + " phase=post_swap";
                 for (const ExtrusionEntity *entity : this_islands_perimeters->entities)
                     if (entity != nullptr)
-                        wave_phys_order_log_entity('B', ordinal++, *entity);
+                        wave_phys_order_log_entity('B', ordinal++, *entity, b_context);
             }
 
             // Issue #47: carve fill_surfaces by the geometric overhang zone of
