@@ -877,12 +877,62 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
         return {};
     }
 
-    Polygons anchors             = intersection(infill_area, optimized_lower);
-    Polygons inset_anchors       = diff(anchors, expand(overhangs, anchors_size + 0.1 * overhang_flow.scaled_width(), EXTRA_PERIMETER_OFFSET_PARAMETERS));
+    Polygons anchors = intersection(infill_area, optimized_lower);
+
+    const double original_inset_distance =
+        double(anchors_size) + 0.1 * double(overhang_flow.scaled_width());
+
+    Polygons inset_anchors =
+        diff(anchors,
+             expand(overhangs,
+                    original_inset_distance,
+                    EXTRA_PERIMETER_OFFSET_PARAMETERS));
+
+    const size_t original_inset_anchor_count = inset_anchors.size();
+
+    bool   anchor_fallback_attempted = false;
+    bool   anchor_fallback_used      = false;
+    size_t anchor_fallback_count     = 0;
+    double anchor_fallback_area_mm2  = 0.;
+
+    if (! anchors.empty() &&
+        inset_anchors.empty() &&
+        original_inset_distance > double(base_spacing)) {
+        anchor_fallback_attempted = true;
+
+        Polygons fallback_inset_anchors =
+            diff(anchors,
+                 expand(overhangs,
+                        double(base_spacing),
+                        EXTRA_PERIMETER_OFFSET_PARAMETERS));
+
+        anchor_fallback_count    = fallback_inset_anchors.size();
+        anchor_fallback_area_mm2 = wg_polygons_area_mm2(fallback_inset_anchors);
+
+        if (! fallback_inset_anchors.empty()) {
+            inset_anchors = std::move(fallback_inset_anchors);
+            anchor_fallback_used = true;
+        }
+    }
+
+    if (wg_trace_enabled) {
+        std::ostringstream fallback_out;
+        fallback_out << "WG_ANCHOR_FALLBACK"
+                     << " original_distance=" << unscale<double>(original_inset_distance)
+                     << " original_count=" << original_inset_anchor_count
+                     << " fallback_attempted=" << (anchor_fallback_attempted ? 1 : 0)
+                     << " fallback_distance=" << unscale<double>(base_spacing)
+                     << " fallback_count=" << anchor_fallback_count
+                     << " fallback_area=" << anchor_fallback_area_mm2
+                     << " fallback_used=" << (anchor_fallback_used ? 1 : 0)
+                     << " distance_units=mm area_units=mm2";
+        wg_emit(fallback_out.str());
+    }
+
     Polygons inset_overhang_area = diff(infill_area, inset_anchors);
 
     if (wg_trace_enabled) {
-        const double inset_remove_distance_scaled = double(anchors_size) + 0.1 * double(overhang_flow.scaled_width());
+        const double inset_remove_distance_scaled = original_inset_distance;
         std::ostringstream out;
         out << "WG_ANCHORS"
             << " optimized_lower_count=" << optimized_lower.size()
