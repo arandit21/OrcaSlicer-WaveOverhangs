@@ -55,6 +55,32 @@ double wg_polygons_area(const Polygons &polygons)
     return area(polygons);
 }
 
+double wg_polygons_area_mm2(const Polygons &polygons)
+{
+    const double scale_area = double(scale_(1.)) * double(scale_(1.));
+    return scale_area > 0. ? wg_polygons_area(polygons) / scale_area : 0.;
+}
+
+std::string wg_polygons_bbox_mm(const Polygons &polygons)
+{
+    if (polygons.empty())
+        return "EMPTY";
+
+    BoundingBox bbox;
+    for (const Polygon &polygon : polygons)
+        bbox.merge(polygon.points);
+
+    if (! bbox.defined)
+        return "EMPTY";
+
+    std::ostringstream out;
+    out << unscale<double>(bbox.min.x()) << ","
+        << unscale<double>(bbox.min.y()) << ","
+        << unscale<double>(bbox.max.x()) << ","
+        << unscale<double>(bbox.max.y());
+    return out.str();
+}
+
 double wg_polylines_length_mm(const Polylines &polylines)
 {
     double total = 0.;
@@ -855,6 +881,25 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
     Polygons inset_anchors       = diff(anchors, expand(overhangs, anchors_size + 0.1 * overhang_flow.scaled_width(), EXTRA_PERIMETER_OFFSET_PARAMETERS));
     Polygons inset_overhang_area = diff(infill_area, inset_anchors);
 
+    if (wg_trace_enabled) {
+        const double inset_remove_distance_scaled = double(anchors_size) + 0.1 * double(overhang_flow.scaled_width());
+        std::ostringstream out;
+        out << "WG_ANCHORS"
+            << " optimized_lower_count=" << optimized_lower.size()
+            << " optimized_lower_area=" << wg_polygons_area_mm2(optimized_lower)
+            << " anchors_count=" << anchors.size()
+            << " anchors_area=" << wg_polygons_area_mm2(anchors)
+            << " anchors_bbox=" << wg_polygons_bbox_mm(anchors)
+            << " inset_anchors_count=" << inset_anchors.size()
+            << " inset_anchors_area=" << wg_polygons_area_mm2(inset_anchors)
+            << " inset_anchors_bbox=" << wg_polygons_bbox_mm(inset_anchors)
+            << " anchors_size=" << unscale<double>(anchors_size)
+            << " overhang_width=" << unscale<double>(overhang_flow.scaled_width())
+            << " inset_remove_distance=" << unscale<double>(inset_remove_distance_scaled)
+            << " distance_units=mm area_units=mm2 bbox_units=mm";
+        wg_emit(out.str());
+    }
+
     std::vector<ExtrusionPaths> wave_paths;
     Polygons                    filled_area;
 
@@ -956,7 +1001,45 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
 
             const Polygons &full_seed_cover_polygons = additional_shell_count > 0 ? overhang_to_cover : to_polygons(wave_cover);
             const ExPolygon &full_seed_boundary = additional_shell_count > 0 ? overhang : wave_cover;
+
+            // Diagnostic copy only. The original inline expand() below remains unchanged,
+            // so this trace cannot alter the anchoring geometry or its evaluation path.
+            Polygons wg_expanded_seed_cover;
+            if (wg_trace_enabled) {
+                wg_expanded_seed_cover = expand(full_seed_cover_polygons, 1.1 * base_spacing, jtRound, 0.);
+
+                std::ostringstream out;
+                out << "WG_ANCHOR_COVER"
+                    << " region_index=" << region_index
+                    << " wave_cover_index=" << wave_cover_index
+                    << " full_seed_cover_count=" << full_seed_cover_polygons.size()
+                    << " full_seed_cover_area=" << wg_polygons_area_mm2(full_seed_cover_polygons)
+                    << " full_seed_cover_bbox=" << wg_polygons_bbox_mm(full_seed_cover_polygons)
+                    << " base_spacing=" << unscale<double>(base_spacing)
+                    << " seed_expand_distance=" << unscale<double>(1.1 * double(base_spacing))
+                    << " expanded_seed_cover_count=" << wg_expanded_seed_cover.size()
+                    << " expanded_seed_cover_area=" << wg_polygons_area_mm2(wg_expanded_seed_cover)
+                    << " expanded_seed_cover_bbox=" << wg_polygons_bbox_mm(wg_expanded_seed_cover)
+                    << " distance_units=mm area_units=mm2 bbox_units=mm";
+                wg_emit(out.str());
+            }
+
             const Polygons full_anchoring = intersection(expand(full_seed_cover_polygons, 1.1 * base_spacing, jtRound, 0.), inset_anchors);
+            if (wg_trace_enabled) {
+                std::ostringstream intersection_out;
+                intersection_out << "WG_ANCHOR_INTERSECTION"
+                                 << " region_index=" << region_index
+                                 << " wave_cover_index=" << wave_cover_index
+                                 << " expanded_seed_cover_count=" << wg_expanded_seed_cover.size()
+                                 << " expanded_seed_cover_bbox=" << wg_polygons_bbox_mm(wg_expanded_seed_cover)
+                                 << " inset_anchors_count=" << inset_anchors.size()
+                                 << " inset_anchors_bbox=" << wg_polygons_bbox_mm(inset_anchors)
+                                 << " intersection_count=" << full_anchoring.size()
+                                 << " intersection_area=" << wg_polygons_area_mm2(full_anchoring)
+                                 << " intersection_bbox=" << wg_polygons_bbox_mm(full_anchoring)
+                                 << " area_units=mm2 bbox_units=mm";
+                wg_emit(intersection_out.str());
+            }
             if (wg_trace_enabled) {
                 std::ostringstream out;
                 out << "WG_REGION stage=full_anchoring"
