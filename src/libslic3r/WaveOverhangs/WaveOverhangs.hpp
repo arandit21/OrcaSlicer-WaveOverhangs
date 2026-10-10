@@ -12,6 +12,7 @@
 
 #include <tuple>
 #include <vector>
+#include <string>
 
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
@@ -20,6 +21,10 @@
 #include "libslic3r/PrintConfig.hpp"
 
 namespace Slic3r::WaveOverhangs {
+
+// Diagnostic-only handoff for the next generate() call on the current worker thread.
+// It carries correlation context (layer / z / island) without touching geometry.
+void set_next_generate_trace_context(bool enabled, const std::string &context);
 
 std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
     ExPolygons      infill_area,

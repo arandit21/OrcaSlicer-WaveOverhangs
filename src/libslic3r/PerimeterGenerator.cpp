@@ -1290,6 +1290,8 @@ static std::tuple<std::vector<ExtrusionPaths>, Polygons> generate_wave_overhang_
     }
 
     WaveOverhangs::AndersonsGenerator gen;
+    if (trace_wave_order)
+        WaveOverhangs::set_next_generate_trace_context(true, trace_context);
     WaveOverhangs::GenerateResult res = gen.generate(infill_area, lower_slices_polygons, params);
 
     if (trace_wave_order) {

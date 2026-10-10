@@ -16,6 +16,8 @@
 #include <limits>
 #include <unordered_map>
 #include <utility>
+#include <sstream>
+#include <string>
 
 #include "Algorithm/RegionExpansion.hpp"
 #include "BoundingBox.hpp"
@@ -28,10 +30,54 @@
 #include "Polyline.hpp"
 #include "libslic3r.h"
 
+namespace Slic3r {
+bool wave_phys_order_trace_write(const std::string &line);
+}
+
 namespace Slic3r::WaveOverhangs {
 namespace {
 
 #define EXTRA_PERIMETER_OFFSET_PARAMETERS ClipperLib::jtSquare, 0.
+
+thread_local bool        g_wg_next_trace_enabled = false;
+thread_local std::string g_wg_next_trace_context;
+
+double wg_expolygons_area(const ExPolygons &expolygons)
+{
+    double total = 0.;
+    for (const ExPolygon &expolygon : expolygons)
+        total += expolygon.area();
+    return total;
+}
+
+double wg_polygons_area(const Polygons &polygons)
+{
+    return area(polygons);
+}
+
+double wg_polylines_length_mm(const Polylines &polylines)
+{
+    double total = 0.;
+    for (const Polyline &polyline : polylines)
+        total += unscale<double>(polyline.length());
+    return total;
+}
+
+double wg_paths_length_mm(const ExtrusionPaths &paths)
+{
+    double total = 0.;
+    for (const ExtrusionPath &path : paths)
+        total += unscale<double>(path.length());
+    return total;
+}
+
+size_t wg_total_front_count(const std::vector<Polylines> &front_levels)
+{
+    size_t total = 0;
+    for (const Polylines &level : front_levels)
+        total += level.size();
+    return total;
+}
 
 Polylines reconnect_polylines(const Polylines &polylines, double limit_distance)
 {
@@ -684,6 +730,12 @@ void append_zig_zag_front_levels(ExtrusionPaths               &overhang_region,
 
 } // namespace
 
+void set_next_generate_trace_context(bool enabled, const std::string &context)
+{
+    g_wg_next_trace_enabled = enabled;
+    g_wg_next_trace_context = enabled ? context : std::string{};
+}
+
 std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
     ExPolygons      infill_area,
     const Polygons &lower_slices_polygons,
@@ -704,6 +756,35 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
     double          corner_taper_distance_mm,
     double          corner_angle_threshold_deg)
 {
+    // Consume the diagnostic context once. The state is thread-local so parallel
+    // slicer workers cannot overwrite each other's layer correlation.
+    const bool wg_trace_enabled = g_wg_next_trace_enabled;
+    std::string wg_trace_context = std::move(g_wg_next_trace_context);
+    g_wg_next_trace_enabled = false;
+    g_wg_next_trace_context.clear();
+
+    std::string wg_first_empty_stage;
+    auto wg_mark_first_empty = [&](const std::string &stage) {
+        if (wg_first_empty_stage.empty())
+            wg_first_empty_stage = stage;
+    };
+    auto wg_emit = [&](const std::string &payload) {
+        if (wg_trace_enabled)
+            wave_phys_order_trace_write(payload + (wg_trace_context.empty() ? std::string{} : " " + wg_trace_context));
+    };
+
+    if (wg_trace_enabled) {
+        std::ostringstream out;
+        out << "WG_INPUT"
+            << " input_overhang_count=" << infill_area.size()
+            << " input_overhang_area=" << wg_expolygons_area(infill_area)
+            << " input_overhang_empty=" << (infill_area.empty() ? 1 : 0)
+            << " lower_slice_count=" << lower_slices_polygons.size();
+        wg_emit(out.str());
+        if (infill_area.empty())
+            wg_mark_first_empty("INPUT_OVERHANG_EMPTY");
+    }
+
     const coord_t base_spacing       = overhang_flow.scaled_spacing();
     const Flow    wave_flow          = wave_line_width > 0. ? overhang_flow.with_width(float(wave_line_width)) : overhang_flow;
     const coord_t perimeter_overlap  = std::max<coord_t>(0, wave_perimeter_overlap > 0. ? coord_t(scale_(wave_perimeter_overlap)) : 0);
@@ -749,8 +830,26 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
     Polygons    optimized_lower      = ClipperUtils::clip_clipper_polygons_with_subject_bbox(lower_slices_polygons, infill_area_bb);
     Polygons    overhangs            = diff(infill_area, optimized_lower);
 
-    if (overhangs.empty())
+    if (wg_trace_enabled) {
+        std::ostringstream out;
+        out << "WG_REGION stage=overhangs"
+            << " region_count=" << overhangs.size()
+            << " region_area=" << wg_polygons_area(overhangs)
+            << " empty=" << (overhangs.empty() ? 1 : 0);
+        wg_emit(out.str());
+    }
+
+    if (overhangs.empty()) {
+        wg_mark_first_empty("OVERHANGS_EMPTY");
+        if (wg_trace_enabled) {
+            std::ostringstream out;
+            out << "WG_OUTPUT regions=0 total_paths=0 wave_paths=0 residual_polygons=0"
+                << " first_empty_stage=" << wg_first_empty_stage
+                << " return_reason=RETURNED_ZERO";
+            wg_emit(out.str());
+        }
         return {};
+    }
 
     Polygons anchors             = intersection(infill_area, optimized_lower);
     Polygons inset_anchors       = diff(anchors, expand(overhangs, anchors_size + 0.1 * overhang_flow.scaled_width(), EXTRA_PERIMETER_OFFSET_PARAMETERS));
@@ -759,7 +858,20 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
     std::vector<ExtrusionPaths> wave_paths;
     Polygons                    filled_area;
 
-    for (const ExPolygon &overhang : union_ex(to_expolygons(inset_overhang_area))) {
+    const ExPolygons prepared_regions = union_ex(to_expolygons(inset_overhang_area));
+    if (wg_trace_enabled) {
+        std::ostringstream out;
+        out << "WG_REGION stage=inset_overhang_area"
+            << " region_count=" << prepared_regions.size()
+            << " region_area=" << wg_polygons_area(inset_overhang_area)
+            << " empty=" << (prepared_regions.empty() ? 1 : 0);
+        wg_emit(out.str());
+    }
+    if (prepared_regions.empty())
+        wg_mark_first_empty("CANDIDATE_REGION_EMPTY");
+
+    for (size_t region_index = 0; region_index < prepared_regions.size(); ++region_index) {
+        const ExPolygon &overhang = prepared_regions[region_index];
         Polygons overhang_to_cover = to_polygons(overhang);
         Polygons wave_cover_area   = additional_shell_count > 0 ?
             shrink(overhang_to_cover, std::max<coord_t>(0, shell_inner_edge - perimeter_overlap), jtRound, 0.) :
@@ -775,16 +887,69 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
             if (! corners.empty())
                 corner_influence = build_corner_influence(corners, corner_taper_dist);
         }
-        Polygons real_overhang     = intersection(wave_cover_area, overhangs);
-        if (real_overhang.empty())
+        if (wg_trace_enabled) {
+            std::ostringstream out;
+            out << "WG_REGION stage=wave_cover_area_candidate"
+                << " region_index=" << region_index
+                << " region_count=" << wave_cover_area.size()
+                << " region_area=" << wg_polygons_area(wave_cover_area)
+                << " empty=" << (wave_cover_area.empty() ? 1 : 0);
+            wg_emit(out.str());
+        }
+        if (wave_cover_area.empty())
+            wg_mark_first_empty("CANDIDATE_REGION_EMPTY");
+
+        Polygons real_overhang = intersection(wave_cover_area, overhangs);
+        if (wg_trace_enabled) {
+            std::ostringstream out;
+            out << "WG_REGION stage=real_overhang"
+                << " region_index=" << region_index
+                << " region_count=" << real_overhang.size()
+                << " region_area=" << wg_polygons_area(real_overhang)
+                << " empty=" << (real_overhang.empty() ? 1 : 0);
+            wg_emit(out.str());
+        }
+
+        const double bridgeability_input_area = wg_trace_enabled ? wg_polygons_area(wave_cover_area) : 0.;
+        bool should_generate = false;
+        if (real_overhang.empty()) {
+            wg_mark_first_empty("REAL_OVERHANG_EMPTY");
             wave_cover_area.clear();
-        else if (! should_generate_waves_for_region(wave_cover_area, overhang, real_overhang, anchors, inset_anchors, overhang_flow, use_instead_of_bridges))
-            wave_cover_area.clear();
+        } else {
+            should_generate = should_generate_waves_for_region(
+                wave_cover_area, overhang, real_overhang, anchors, inset_anchors,
+                overhang_flow, use_instead_of_bridges);
+            if (! should_generate) {
+                wave_cover_area.clear();
+                wg_mark_first_empty("CANDIDATE_REGION_EMPTY");
+            }
+        }
+
+        if (wg_trace_enabled) {
+            std::ostringstream decision;
+            decision << "WG_BRIDGEABILITY"
+                     << " region_index=" << region_index
+                     << " should_generate=" << (should_generate ? 1 : 0)
+                     << " instead_of_bridges=" << (use_instead_of_bridges ? 1 : 0)
+                     << " input_area=" << bridgeability_input_area
+                     << " output_area=" << wg_polygons_area(wave_cover_area);
+            wg_emit(decision.str());
+
+            std::ostringstream out;
+            out << "WG_REGION stage=wave_cover_area_after_bridgeability"
+                << " region_index=" << region_index
+                << " region_count=" << wave_cover_area.size()
+                << " region_area=" << wg_polygons_area(wave_cover_area)
+                << " empty=" << (wave_cover_area.empty() ? 1 : 0);
+            wg_emit(out.str());
+        }
 
         ExtrusionPaths &overhang_region = wave_paths.emplace_back();
         Polygons        filled_overhang_region;
 
-        for (const ExPolygon &wave_cover : union_ex(to_expolygons(wave_cover_area))) {
+        const ExPolygons wave_covers = union_ex(to_expolygons(wave_cover_area));
+        for (size_t wave_cover_index = 0; wave_cover_index < wave_covers.size(); ++wave_cover_index) {
+            const ExPolygon &wave_cover = wave_covers[wave_cover_index];
             ExPolygons split_wave_covers = { wave_cover };
             if (Polygons split_slits = generate_narrow_split_slits(wave_cover, wave_spacing, min_wave_width); ! split_slits.empty())
                 split_wave_covers = union_ex(diff_ex(ExPolygons{ wave_cover }, split_slits));
@@ -792,13 +957,48 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
             const Polygons &full_seed_cover_polygons = additional_shell_count > 0 ? overhang_to_cover : to_polygons(wave_cover);
             const ExPolygon &full_seed_boundary = additional_shell_count > 0 ? overhang : wave_cover;
             const Polygons full_anchoring = intersection(expand(full_seed_cover_polygons, 1.1 * base_spacing, jtRound, 0.), inset_anchors);
-            const Polylines base_seeds = generate_wave_overhang_seeds(full_seed_boundary, full_anchoring, seed_expansion);
+            if (wg_trace_enabled) {
+                std::ostringstream out;
+                out << "WG_REGION stage=full_anchoring"
+                    << " region_index=" << region_index
+                    << " wave_cover_index=" << wave_cover_index
+                    << " region_count=" << full_anchoring.size()
+                    << " region_area=" << wg_polygons_area(full_anchoring)
+                    << " empty=" << (full_anchoring.empty() ? 1 : 0);
+                wg_emit(out.str());
+            }
+            if (full_anchoring.empty())
+                wg_mark_first_empty("ANCHORING_EMPTY");
 
-            for (const ExPolygon &split_wave_cover : split_wave_covers) {
+            const Polylines base_seeds = generate_wave_overhang_seeds(full_seed_boundary, full_anchoring, seed_expansion);
+            if (base_seeds.empty())
+                wg_mark_first_empty("SEEDS_EMPTY");
+
+            for (size_t split_index = 0; split_index < split_wave_covers.size(); ++split_index) {
+                const ExPolygon &split_wave_cover = split_wave_covers[split_index];
                 Polygons wave_cover_polygons = to_polygons(split_wave_cover);
                 Polylines seeds = base_seeds.empty() ? Polylines{} : intersection_pl(base_seeds, wave_cover_polygons);
-                if (seeds.empty())
+
+                if (wg_trace_enabled) {
+                    std::ostringstream out;
+                    out << "WG_SEEDS"
+                        << " region_index=" << region_index
+                        << " wave_cover_index=" << wave_cover_index
+                        << " split_index=" << split_index
+                        << " base_seed_count=" << base_seeds.size()
+                        << " seed_area=NA_LINE_GEOMETRY"
+                        << " base_seed_length_mm=" << wg_polylines_length_mm(base_seeds)
+                        << " after_intersection_count=" << seeds.size()
+                        << " after_intersection_area=NA_LINE_GEOMETRY"
+                        << " after_intersection_length_mm=" << wg_polylines_length_mm(seeds)
+                        << " empty=" << (seeds.empty() ? 1 : 0);
+                    wg_emit(out.str());
+                }
+
+                if (seeds.empty()) {
+                    wg_mark_first_empty(base_seeds.empty() ? "SEEDS_EMPTY" : "SEEDS_AFTER_INTERSECTION_EMPTY");
                     continue;
+                }
 
                 Polygons trim_boundary = shrink(wave_cover_polygons, std::max<coord_t>(1, wave_flow.scaled_width() / 2), jtRound, 0.);
                 if (trim_boundary.empty())
@@ -808,8 +1008,24 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
 
                 const coord_t seed_offset = additional_shell_count > 0 ? shell_inner_edge + seed_expansion : seed_expansion;
                 Polygons accumulated_region = intersection(offset(seeds, float(seed_offset), jtRound, 0., ClipperLib::etOpenRound), wave_cover_polygons);
-                if (accumulated_region.empty())
+                const double initial_accumulated_area = wg_polygons_area(accumulated_region);
+
+                if (wg_trace_enabled) {
+                    std::ostringstream out;
+                    out << "WG_INITIAL"
+                        << " region_index=" << region_index
+                        << " wave_cover_index=" << wave_cover_index
+                        << " split_index=" << split_index
+                        << " accumulated_region_count=" << accumulated_region.size()
+                        << " accumulated_area=" << initial_accumulated_area
+                        << " empty=" << (accumulated_region.empty() ? 1 : 0);
+                    wg_emit(out.str());
+                }
+
+                if (accumulated_region.empty()) {
+                    wg_mark_first_empty("INITIAL_REGION_EMPTY");
                     continue;
+                }
 
                 std::vector<Polylines> front_levels;
                 double accumulated_area = area(accumulated_region);
@@ -820,8 +1036,24 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                     && ! corner_influence.empty()
                     && ! intersection(corner_influence, wave_cover_polygons).empty();
                 for (;;) {
-                    if (max_iterations > 0 && iteration >= max_iterations)
+                    if (max_iterations > 0 && iteration >= max_iterations) {
+                        if (wg_trace_enabled) {
+                            std::ostringstream out;
+                            out << "WG_GROWTH"
+                                << " region_index=" << region_index
+                                << " wave_cover_index=" << wave_cover_index
+                                << " split_index=" << split_index
+                                << " iteration=" << iteration
+                                << " current_front_count=" << wg_total_front_count(front_levels)
+                                << " current_area=" << accumulated_area
+                                << " next_front_count=0 next_area=" << accumulated_area
+                                << " area_growth=0"
+                                << " min_area_growth=" << min_area_growth
+                                << " stop_reason=MAX_ITERATIONS";
+                            wg_emit(out.str());
+                        }
                         break;
+                    }
                     ++iteration;
 
                     // Intercalated corner-only fronts, emitted BEFORE the main
@@ -851,13 +1083,49 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                         }
                     }
 
+                    const size_t current_front_count = wg_trace_enabled ? wg_total_front_count(front_levels) : 0;
                     Polygons next_region = intersection(offset(accumulated_region, float(wave_spacing), jtRound, 0.), wave_cover_polygons);
-                    if (next_region.empty())
+                    if (next_region.empty()) {
+                        wg_mark_first_empty("NEXT_REGION_EMPTY_ITER_" + std::to_string(iteration));
+                        if (wg_trace_enabled) {
+                            std::ostringstream out;
+                            out << "WG_GROWTH"
+                                << " region_index=" << region_index
+                                << " wave_cover_index=" << wave_cover_index
+                                << " split_index=" << split_index
+                                << " iteration=" << iteration
+                                << " current_front_count=" << current_front_count
+                                << " current_area=" << accumulated_area
+                                << " next_front_count=0 next_area=0 area_growth=" << -accumulated_area
+                                << " min_area_growth=" << min_area_growth
+                                << " stop_reason=NEXT_REGION_EMPTY";
+                            wg_emit(out.str());
+                        }
                         break;
+                    }
 
                     double next_area = area(next_region);
-                    if (next_area <= accumulated_area + min_area_growth)
+                    const double area_growth = next_area - accumulated_area;
+                    if (next_area <= accumulated_area + min_area_growth) {
+                        wg_mark_first_empty("GROWTH_STALLED");
+                        if (wg_trace_enabled) {
+                            std::ostringstream out;
+                            out << "WG_GROWTH"
+                                << " region_index=" << region_index
+                                << " wave_cover_index=" << wave_cover_index
+                                << " split_index=" << split_index
+                                << " iteration=" << iteration
+                                << " current_front_count=" << current_front_count
+                                << " current_area=" << accumulated_area
+                                << " next_front_count=0"
+                                << " next_area=" << next_area
+                                << " area_growth=" << area_growth
+                                << " min_area_growth=" << min_area_growth
+                                << " stop_reason=GROWTH_STALLED";
+                            wg_emit(out.str());
+                        }
                         break;
+                    }
 
                     Polylines fronts = intersection_pl(to_polylines(next_region), trim_boundary);
                     for (Polyline &front : fronts)
@@ -867,12 +1135,44 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                         fronts.end());
                     fronts = reconnect_polylines(fronts, wave_spacing);
 
+                    const size_t next_front_count = fronts.size();
+                    if (wg_trace_enabled) {
+                        std::ostringstream out;
+                        out << "WG_GROWTH"
+                            << " region_index=" << region_index
+                            << " wave_cover_index=" << wave_cover_index
+                            << " split_index=" << split_index
+                            << " iteration=" << iteration
+                            << " current_front_count=" << current_front_count
+                            << " current_area=" << accumulated_area
+                            << " next_front_count=" << next_front_count
+                            << " next_area=" << next_area
+                            << " area_growth=" << area_growth
+                            << " min_area_growth=" << min_area_growth
+                            << " stop_reason=CONTINUE";
+                        wg_emit(out.str());
+                    }
+
                     if (! fronts.empty())
                         front_levels.emplace_back(std::move(fronts));
 
                     accumulated_region = std::move(next_region);
                     accumulated_area   = next_area;
                 }
+
+                if (wg_trace_enabled) {
+                    std::ostringstream out;
+                    out << "WG_FRONT_LEVELS"
+                        << " region_index=" << region_index
+                        << " wave_cover_index=" << wave_cover_index
+                        << " split_index=" << split_index
+                        << " level_count=" << front_levels.size()
+                        << " total_fronts=" << wg_total_front_count(front_levels)
+                        << " total_area=" << accumulated_area;
+                    wg_emit(out.str());
+                }
+                if (front_levels.empty())
+                    wg_mark_first_empty("FRONT_LEVELS_EMPTY");
 
                 if (! front_levels.empty()) {
                     ExtrusionPaths split_region_paths;
@@ -884,6 +1184,20 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                             collected_fronts.insert(collected_fronts.end(), level.begin(), level.end());
                         append_wave_fronts(split_region_paths, collected_fronts, wave_flow, zig_zag_connector_limit, wave_pattern);
                     }
+                    if (wg_trace_enabled) {
+                        std::ostringstream out;
+                        out << "WG_SPLIT"
+                            << " region_index=" << region_index
+                            << " wave_cover_index=" << wave_cover_index
+                            << " split_index=" << split_index
+                            << " input_area=" << accumulated_area
+                            << " produced_path_count=" << split_region_paths.size()
+                            << " produced_length=" << wg_paths_length_mm(split_region_paths);
+                        wg_emit(out.str());
+                    }
+                    if (split_region_paths.empty())
+                        wg_mark_first_empty("SPLIT_PRODUCED_ZERO");
+
                     if (! split_region_paths.empty()) {
                         append(overhang_region, split_region_paths);
                         append(
@@ -910,7 +1224,32 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
     }
 
     tag_wave_overhang_paths(wave_paths);
-    return { wave_paths, union_safety_offset(closing_ex(filled_area, float(filled_area_regularization), jtRound, 0.)) };
+    Polygons residual = union_safety_offset(closing_ex(filled_area, float(filled_area_regularization), jtRound, 0.));
+
+    if (wg_trace_enabled) {
+        size_t total_paths = 0;
+        size_t wave_path_count = 0;
+        for (const ExtrusionPaths &region : wave_paths) {
+            total_paths += region.size();
+            for (const ExtrusionPath &path : region)
+                if (path.wave_overhang)
+                    ++wave_path_count;
+        }
+        if (total_paths == 0 && wg_first_empty_stage.empty())
+            wg_first_empty_stage = "OUTPUT_EMPTY_UNCLASSIFIED";
+
+        std::ostringstream out;
+        out << "WG_OUTPUT"
+            << " regions=" << wave_paths.size()
+            << " total_paths=" << total_paths
+            << " wave_paths=" << wave_path_count
+            << " residual_polygons=" << residual.size()
+            << " first_empty_stage=" << (wg_first_empty_stage.empty() ? "NONE" : wg_first_empty_stage)
+            << " return_reason=" << (total_paths == 0 ? "RETURNED_ZERO" : "RETURNED_PATHS");
+        wg_emit(out.str());
+    }
+
+    return { std::move(wave_paths), std::move(residual) };
 }
 
 } // namespace Slic3r::WaveOverhangs
