@@ -1039,6 +1039,56 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                                  << " intersection_bbox=" << wg_polygons_bbox_mm(full_anchoring)
                                  << " area_units=mm2 bbox_units=mm";
                 wg_emit(intersection_out.str());
+
+                // Diagnostic-only counterfactual probes. None of these results
+                // replace production inset_anchors or full_anchoring.
+                const double wg_overhang_width_scaled = double(overhang_flow.scaled_width());
+                const double wg_current_distance_scaled =
+                    double(anchors_size) + 0.1 * wg_overhang_width_scaled;
+
+                struct WgAnchorInsetProbe {
+                    const char *label;
+                    double      distance_scaled;
+                };
+
+                const std::array<WgAnchorInsetProbe, 6> wg_probes {{
+                    { "ZERO",               0.0 },
+                    { "OVERHANG_WIDTH_0P1", 0.1 * wg_overhang_width_scaled },
+                    { "BASE_SPACING_0P5",   0.5 * double(base_spacing) },
+                    { "BASE_SPACING_1P0",   1.0 * double(base_spacing) },
+                    { "BASE_SPACING_2P0",   2.0 * double(base_spacing) },
+                    { "CURRENT",            wg_current_distance_scaled }
+                }};
+
+                for (const WgAnchorInsetProbe &probe : wg_probes) {
+                    const Polygons probe_inset_anchors =
+                        diff(anchors,
+                             expand(overhangs,
+                                    probe.distance_scaled,
+                                    EXTRA_PERIMETER_OFFSET_PARAMETERS));
+
+                    const Polygons probe_full_anchoring =
+                        intersection(wg_expanded_seed_cover, probe_inset_anchors);
+
+                    std::ostringstream probe_out;
+                    probe_out << "WG_ANCHOR_INSET_PROBE"
+                              << " region_index=" << region_index
+                              << " wave_cover_index=" << wave_cover_index
+                              << " probe=" << probe.label
+                              << " distance_mm=" << unscale<double>(probe.distance_scaled)
+                              << " inset_anchor_count=" << probe_inset_anchors.size()
+                              << " inset_anchor_area_mm2=" << wg_polygons_area_mm2(probe_inset_anchors)
+                              << " inset_anchor_bbox=" << wg_polygons_bbox_mm(probe_inset_anchors)
+                              << " full_anchoring_count=" << probe_full_anchoring.size()
+                              << " full_anchoring_area_mm2=" << wg_polygons_area_mm2(probe_full_anchoring)
+                              << " base_spacing=" << unscale<double>(base_spacing)
+                              << " perimeter_count=" << perimeter_count
+                              << " anchors_size=" << unscale<double>(anchors_size)
+                              << " overhang_width=" << unscale<double>(wg_overhang_width_scaled)
+                              << " current_distance=" << unscale<double>(wg_current_distance_scaled)
+                              << " distance_units=mm area_units=mm2";
+                    wg_emit(probe_out.str());
+                }
             }
             if (wg_trace_enabled) {
                 std::ostringstream out;
