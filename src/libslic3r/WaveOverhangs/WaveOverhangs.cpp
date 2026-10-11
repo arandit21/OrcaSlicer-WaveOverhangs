@@ -1227,10 +1227,9 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                     continue;
                 }
 
-                // FIRST-FRONT TRACE ONLY:
-                // Build the counterfactual initial printable candidate with the
-                // same trim/simplify/filter/reconnect semantics as normal fronts.
-                // Do NOT add this candidate to front_levels.
+                // FIRST-FRONT CONTACT CORRECTIVE:
+                // The anchored initial printable front must be emitted before
+                // the first expansion by wave_spacing. Trace remains available.
                 Polylines   wg_initial_boundary;
                 Polylines   wg_initial_candidate;
                 size_t      wg_initial_accumulated_count = 0;
@@ -1246,29 +1245,49 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                 double      wg_first_main_front_length_mm = 0.;
                 std::string wg_first_main_front_bbox = "NOT_REACHED";
 
+                // WG_FIRST_FRONT_CONTACT:
+                // Print the seed-derived initial boundary as the first wave.
+                // Previously it was computed only in trace mode and never emitted;
+                // the first printed front was already advanced by wave_spacing.
+                // Use the same clipping, simplify, filtering, and reconnect rules
+                // as for subsequent printable wavefronts.
+                wg_initial_boundary = to_polylines(accumulated_region);
+                wg_initial_candidate =
+                    intersection_pl(wg_initial_boundary, trim_boundary);
+
+                for (Polyline &front : wg_initial_candidate)
+                    front.simplify(std::min(0.05 * wave_spacing, scaled_resolution));
+
+                wg_initial_candidate.erase(
+                    std::remove_if(
+                        wg_initial_candidate.begin(),
+                        wg_initial_candidate.end(),
+                        [](const Polyline &front) { return front.points.size() < 2; }),
+                    wg_initial_candidate.end());
+
+                wg_initial_candidate =
+                    reconnect_polylines(wg_initial_candidate, wave_spacing);
+
                 if (wg_trace_enabled) {
                     wg_initial_accumulated_count = accumulated_region.size();
-                    wg_initial_boundary = to_polylines(accumulated_region);
                     wg_initial_accumulated_bbox = wg_polylines_bbox_mm(wg_initial_boundary);
-
-                    wg_initial_candidate =
-                        intersection_pl(wg_initial_boundary, trim_boundary);
-
-                    for (Polyline &front : wg_initial_candidate)
-                        front.simplify(std::min(0.05 * wave_spacing, scaled_resolution));
-
-                    wg_initial_candidate.erase(
-                        std::remove_if(
-                            wg_initial_candidate.begin(),
-                            wg_initial_candidate.end(),
-                            [](const Polyline &front) { return front.points.size() < 2; }),
-                        wg_initial_candidate.end());
-
-                    wg_initial_candidate =
-                        reconnect_polylines(wg_initial_candidate, wave_spacing);
                 }
 
+                const size_t wg_initial_candidate_count = wg_initial_candidate.size();
+                const double wg_initial_candidate_length_mm = wg_trace_enabled
+                    ? wg_polylines_length_mm(wg_initial_candidate) : 0.;
+                const std::string wg_initial_candidate_bbox = wg_trace_enabled
+                    ? wg_polylines_bbox_mm(wg_initial_candidate) : "TRACE_OFF";
+
                 std::vector<Polylines> front_levels;
+                const bool wg_initial_front_emitted = !wg_initial_candidate.empty();
+                if (wg_initial_front_emitted) {
+                    if (wg_trace_enabled) {
+                        wg_first_emitted_front = wg_initial_candidate;
+                        wg_first_emitted_source = "INITIAL_CANDIDATE";
+                    }
+                    front_levels.emplace_back(std::move(wg_initial_candidate));
+                }
                 double accumulated_area = area(accumulated_region);
                 int    iteration        = 0;
                 // Per-region flag: only run the taper if there's a corner
@@ -1443,10 +1462,10 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                                     << " seed_offset_mm=" << unscale<double>(seed_offset)
                                     << " accumulated_region_count=" << wg_initial_accumulated_count
                                     << " accumulated_bbox=" << wg_initial_accumulated_bbox
-                                    << " initial_candidate_count=" << wg_initial_candidate.size()
-                                    << " initial_candidate_length_mm=" << wg_polylines_length_mm(wg_initial_candidate)
-                                    << " initial_candidate_bbox=" << wg_polylines_bbox_mm(wg_initial_candidate)
-                                    << " initial_candidate_added_to_front_levels=0"
+                                    << " initial_candidate_count=" << wg_initial_candidate_count
+                                    << " initial_candidate_length_mm=" << wg_initial_candidate_length_mm
+                                    << " initial_candidate_bbox=" << wg_initial_candidate_bbox
+                                    << " initial_candidate_added_to_front_levels=" << (wg_initial_front_emitted ? 1 : 0)
                                     << " wave_spacing_mm=" << unscale<double>(wave_spacing)
                                     << " first_next_region_count=" << wg_first_next_region_count
                                     << " first_next_bbox=" << wg_first_next_region_bbox
