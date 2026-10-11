@@ -89,6 +89,23 @@ double wg_polylines_length_mm(const Polylines &polylines)
     return total;
 }
 
+std::string wg_polylines_bbox_mm(const Polylines &polylines)
+{
+    if (polylines.empty())
+        return "EMPTY";
+
+    const BoundingBox bbox = get_extents(polylines);
+    if (! bbox.defined)
+        return "EMPTY";
+
+    std::ostringstream out;
+    out << unscale<double>(bbox.min.x()) << ","
+        << unscale<double>(bbox.min.y()) << ","
+        << unscale<double>(bbox.max.x()) << ","
+        << unscale<double>(bbox.max.y());
+    return out.str();
+}
+
 double wg_paths_length_mm(const ExtrusionPaths &paths)
 {
     double total = 0.;
@@ -1210,6 +1227,47 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                     continue;
                 }
 
+                // FIRST-FRONT TRACE ONLY:
+                // Build the counterfactual initial printable candidate with the
+                // same trim/simplify/filter/reconnect semantics as normal fronts.
+                // Do NOT add this candidate to front_levels.
+                Polylines   wg_initial_boundary;
+                Polylines   wg_initial_candidate;
+                size_t      wg_initial_accumulated_count = 0;
+                std::string wg_initial_accumulated_bbox = "TRACE_OFF";
+
+                Polylines   wg_first_emitted_front;
+                std::string wg_first_emitted_source = "NONE";
+
+                size_t      wg_first_next_region_count = 0;
+                std::string wg_first_next_region_bbox = "NOT_REACHED";
+
+                size_t      wg_first_main_front_count = 0;
+                double      wg_first_main_front_length_mm = 0.;
+                std::string wg_first_main_front_bbox = "NOT_REACHED";
+
+                if (wg_trace_enabled) {
+                    wg_initial_accumulated_count = accumulated_region.size();
+                    wg_initial_boundary = to_polylines(accumulated_region);
+                    wg_initial_accumulated_bbox = wg_polylines_bbox_mm(wg_initial_boundary);
+
+                    wg_initial_candidate =
+                        intersection_pl(wg_initial_boundary, trim_boundary);
+
+                    for (Polyline &front : wg_initial_candidate)
+                        front.simplify(std::min(0.05 * wave_spacing, scaled_resolution));
+
+                    wg_initial_candidate.erase(
+                        std::remove_if(
+                            wg_initial_candidate.begin(),
+                            wg_initial_candidate.end(),
+                            [](const Polyline &front) { return front.points.size() < 2; }),
+                        wg_initial_candidate.end());
+
+                    wg_initial_candidate =
+                        reconnect_polylines(wg_initial_candidate, wave_spacing);
+                }
+
                 std::vector<Polylines> front_levels;
                 double accumulated_area = area(accumulated_region);
                 int    iteration        = 0;
@@ -1261,13 +1319,26 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                                                [](const Polyline &front) { return front.points.size() < 2; }),
                                 sub_fronts.end());
                             sub_fronts = reconnect_polylines(sub_fronts, wave_spacing_corner);
-                            if (! sub_fronts.empty())
+                            if (! sub_fronts.empty()) {
+                                if (wg_trace_enabled && wg_first_emitted_front.empty()) {
+                                    wg_first_emitted_front = sub_fronts;
+                                    wg_first_emitted_source =
+                                        "TAPER_SUB_" + std::to_string(sub);
+                                }
                                 front_levels.emplace_back(std::move(sub_fronts));
+                            }
                         }
                     }
 
                     const size_t current_front_count = wg_trace_enabled ? wg_total_front_count(front_levels) : 0;
                     Polygons next_region = intersection(offset(accumulated_region, float(wave_spacing), jtRound, 0.), wave_cover_polygons);
+
+                    if (wg_trace_enabled && iteration == 1) {
+                        wg_first_next_region_count = next_region.size();
+                        wg_first_next_region_bbox =
+                            wg_polylines_bbox_mm(to_polylines(next_region));
+                    }
+
                     if (next_region.empty()) {
                         wg_mark_first_empty("NEXT_REGION_EMPTY_ITER_" + std::to_string(iteration));
                         if (wg_trace_enabled) {
@@ -1318,6 +1389,21 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
                         fronts.end());
                     fronts = reconnect_polylines(fronts, wave_spacing);
 
+                    if (wg_trace_enabled && iteration == 1) {
+                        wg_first_main_front_count = fronts.size();
+                        wg_first_main_front_length_mm =
+                            wg_polylines_length_mm(fronts);
+                        wg_first_main_front_bbox =
+                            wg_polylines_bbox_mm(fronts);
+                    }
+
+                    if (wg_trace_enabled &&
+                        ! fronts.empty() &&
+                        wg_first_emitted_front.empty()) {
+                        wg_first_emitted_front = fronts;
+                        wg_first_emitted_source = "NEXT_REGION";
+                    }
+
                     const size_t next_front_count = fronts.size();
                     if (wg_trace_enabled) {
                         std::ostringstream out;
@@ -1341,6 +1427,37 @@ std::tuple<std::vector<ExtrusionPaths>, Polygons> generate(
 
                     accumulated_region = std::move(next_region);
                     accumulated_area   = next_area;
+                }
+
+                if (wg_trace_enabled) {
+                    std::ostringstream first_front_out;
+                    first_front_out << "WG_FIRST_FRONT"
+                                    << " region_index=" << region_index
+                                    << " wave_cover_index=" << wave_cover_index
+                                    << " split_index=" << split_index
+                                    << " anchor_count=" << full_anchoring.size()
+                                    << " anchor_bbox=" << wg_polygons_bbox_mm(full_anchoring)
+                                    << " seed_count=" << seeds.size()
+                                    << " seed_length_mm=" << wg_polylines_length_mm(seeds)
+                                    << " seed_bbox=" << wg_polylines_bbox_mm(seeds)
+                                    << " seed_offset_mm=" << unscale<double>(seed_offset)
+                                    << " accumulated_region_count=" << wg_initial_accumulated_count
+                                    << " accumulated_bbox=" << wg_initial_accumulated_bbox
+                                    << " initial_candidate_count=" << wg_initial_candidate.size()
+                                    << " initial_candidate_length_mm=" << wg_polylines_length_mm(wg_initial_candidate)
+                                    << " initial_candidate_bbox=" << wg_polylines_bbox_mm(wg_initial_candidate)
+                                    << " initial_candidate_added_to_front_levels=0"
+                                    << " wave_spacing_mm=" << unscale<double>(wave_spacing)
+                                    << " first_next_region_count=" << wg_first_next_region_count
+                                    << " first_next_bbox=" << wg_first_next_region_bbox
+                                    << " first_main_front_count=" << wg_first_main_front_count
+                                    << " first_main_front_length_mm=" << wg_first_main_front_length_mm
+                                    << " first_main_front_bbox=" << wg_first_main_front_bbox
+                                    << " first_emitted_source=" << wg_first_emitted_source
+                                    << " first_emitted_count=" << wg_first_emitted_front.size()
+                                    << " first_emitted_length_mm=" << wg_polylines_length_mm(wg_first_emitted_front)
+                                    << " first_emitted_bbox=" << wg_polylines_bbox_mm(wg_first_emitted_front);
+                    wg_emit(first_front_out.str());
                 }
 
                 if (wg_trace_enabled) {
